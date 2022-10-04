@@ -1,0 +1,538 @@
+
+/*-----------------------------------------
+ test program
+ ----------------------------------------*/
+
+#include<stdio.h>
+#include<process.h>   //スレッド起動するために必要
+#include "resource.h" // ResEditの場合はこうなります。
+#include "cserial.h"
+#include<math.h>
+#include <windows.h>
+#include<stdlib.h>
+#include<time.h>
+
+ //OPEN_CVのインクルードファイル
+#include <opencv2/core/utility.hpp>
+#include "opencv2/video/tracking.hpp"
+#include "opencv2/imgproc.hpp"
+#include "opencv2/videoio.hpp"
+#include "opencv2/highgui.hpp"
+#include <iostream>
+#include <ctype.h>
+
+#ifdef _DEBUG
+#pragma comment(lib, "opencv_world452d.lib")
+#else
+#pragma comment(lib, "opencv_world452.lib")
+#endif
+
+#define M_PI 3.1415926535897932384626433832795
+#define ON 1
+#define OFF 0
+#define CAP_NUM 0			//カメラの番号はここを変える（0:PC内蔵　1:外部USBカメラ
+#define TAG_MAX 100
+#define TAG_MIN 200
+
+#define MSG(m) {\
+MessageBoxA(NULL,m,NULL,MB_OK);}
+
+//WinAPI関連の変数や構造体
+FILE* fp = NULL;//ファイルポインタ宣言
+SYSTEMTIME systime;//時間記録用
+char FileName[127] = { "FILE_AD" };//ファイルの名前用の文字列
+static short int file_flag = 0; 		//記録用フラグ
+int init = OFF;					//記録時の初期設定用
+
+// WinAPI関連
+HWND hwnd, hwnd2;
+MSG msg;
+//インスタンスハンドル
+HINSTANCE hinst;
+// ダイアログ関数のプロトタイプ宣言
+//BOOL CALLBACK DlgWndProc(HWND, UINT, WPARAM, LPARAM);
+BOOL CALLBACK DialogFunc(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK WinProc(HWND, UINT, WPARAM, LPARAM);
+
+//カメラのスレッド関連
+unsigned int __stdcall CameraCaptureThread(PVOID pv);
+HANDLE threadHandle = NULL;
+BOOL endFlag = FALSE;
+
+using namespace cv;
+using namespace std;
+Mat image;
+bool backprojMode = false;
+bool selectObject = false;
+int trackObject = 0;
+int trackObject2 = 0;
+bool showHist = true;
+Point origin;
+Rect selection;
+int vmin = 10, vmax = 256, smin = 30;
+float CENTER_X, CENTER_Y, s_x, s_y, AREA;
+float TARGET_R = 100;
+float DISTANCE;
+unsigned int OK_flag = 0;
+int	STATUS = 0;		//モード変数
+int ccount = 0, s_timer = 0;
+int OK_counter = 0, OK_cc = 0;
+int rand_ax = 0, rand_ay = 0, rand_b = 0;
+int bb_set = 0;
+int rand_ax_p;
+int rand_ay_p;
+int rand_b_p;
+float TEST_D = TARGET_R * 0.3, TEST_S = TARGET_R * 0.1;//ターゲット閾値
+
+
+// User draws box around object to track. This triggers CAMShift to start tracking
+//マウス操作
+static void onMouse(int event, int x, int y, int, void*)
+{
+	if (selectObject)
+	{
+		selection.x = MIN(x, origin.x);
+		selection.y = MIN(y, origin.y);
+		selection.width = std::abs(x - origin.x);
+		selection.height = std::abs(y - origin.y);
+		selection &= Rect(0, 0, image.cols, image.rows);
+	}
+	switch (event)
+	{
+	case EVENT_LBUTTONDOWN:
+		origin = Point(x, y);
+		selection = Rect(x, y, 0, 0);
+		selectObject = true;
+		break;
+	case EVENT_LBUTTONUP:
+		selectObject = false;
+		if (selection.width > 0 && selection.height > 0)
+			trackObject = -1;   // Set up CAMShift properties in main() loop
+		break;
+	}
+}
+
+unsigned int __stdcall CameraCaptureThread(PVOID pv) {
+	int argc;
+	const char** argv;
+
+	VideoCapture cap;
+	Rect trackWindow;
+	int hsize = 16;
+	float hranges[] = { 0,180 };
+	const float* phranges = hranges;
+
+	Mat frame, hsv, hue, mask, hist, histimg = Mat::zeros(200, 320, CV_8UC3), backproj;
+	bool paused = false;
+	int lens = 0, lent = 0;
+
+	cap.open(CAP_NUM);		//ここの数字を変えることでキャブチャーするカメラを選択できる。0：PC内蔵　1：外部USBカメラ
+	if (!cap.isOpened()) {
+		STATUS = -1;
+		return -1;
+	}
+
+	//カメラ用ウィンドウの設定
+	namedWindow("Histogram", cv::WINDOW_AUTOSIZE);
+	moveWindow("Histogram", 5, 580);
+	namedWindow("CamShift Demo", cv::WINDOW_AUTOSIZE);
+	moveWindow("CamShift Demo", 800, 5);
+	setMouseCallback("CamShift Demo", onMouse, 0);
+	createTrackbar("Vmin", "CamShift Demo", &vmin, 256, 0);
+	createTrackbar("Vmax", "CamShift Demo", &vmax, 256, 0);
+	createTrackbar("Smin", "CamShift Demo", &smin, 256, 0);
+	STATUS = 1;	//起動完了
+
+
+	for (;;)
+	{
+		if (endFlag) break;		//終了
+
+		if (!paused)
+		{
+			cap >> frame;
+			if (frame.empty())
+				break;
+		}
+		frame.copyTo(image);
+		if (!paused)
+		{
+			cvtColor(image, hsv, COLOR_BGR2HSV);
+			if (trackObject)
+			{
+				int _vmin = vmin, _vmax = vmax;
+				inRange(hsv, Scalar(0, smin, MIN(_vmin, _vmax)),
+					Scalar(180, 256, MAX(_vmin, _vmax)), mask);
+				int ch[] = { 0, 0 };
+				hue.create(hsv.size(), hsv.depth());
+				mixChannels(&hsv, 1, &hue, 1, ch, 1);
+				if (trackObject < 0)
+				{
+					// Object has been selected by user, set up CAMShift search properties once
+					Mat roi(hue, selection), maskroi(mask, selection);
+					calcHist(&roi, 1, 0, maskroi, hist, 1, &hsize, &phranges);
+					normalize(hist, hist, 0, 255, NORM_MINMAX);
+					trackWindow = selection;
+					trackObject = 1; // Don't set up again, unless user selects new ROI
+					histimg = Scalar::all(0);
+					int binW = histimg.cols / hsize;
+					Mat buf(1, hsize, CV_8UC3);
+					for (int i = 0; i < hsize; i++)
+						buf.at<Vec3b>(i) = Vec3b(saturate_cast<uchar>(i * 180. / hsize), 255, 255);
+					cvtColor(buf, buf, COLOR_HSV2BGR);
+					for (int i = 0; i < hsize; i++)
+					{
+						int val = saturate_cast<int>(hist.at<float>(i) * histimg.rows / 255);
+						rectangle(histimg, Point(i * binW, histimg.rows),
+							Point((i + 1) * binW, histimg.rows - val),
+							Scalar(buf.at<Vec3b>(i)), -1, 8);
+					}
+				}
+				// Perform CAMShift
+				calcBackProject(&hue, 1, 0, hist, backproj, &phranges);
+				backproj &= mask;
+				RotatedRect trackBox = CamShift(backproj, trackWindow,
+					TermCriteria(TermCriteria::EPS | TermCriteria::COUNT, 10, 1));
+				if (trackWindow.area() <= 1)
+				{
+					int cols = backproj.cols, rows = backproj.rows, r = (MIN(cols, rows) + 5) / 6;
+					trackWindow = Rect(trackWindow.x - r, trackWindow.y - r,
+						trackWindow.x + r, trackWindow.y + r) &
+						Rect(0, 0, cols, rows);
+				}
+				if (backprojMode) cvtColor(backproj, image, COLOR_GRAY2BGR);//画像中で対象物体のように見える部分は白く，それ以外の部分は黒くする
+				ellipse(image, trackBox, Scalar(0, 0, 255), 3, LINE_AA);
+
+				/*-------------------------------------------------------*/
+				CENTER_X = image.cols / 2;	//画面中央（X）の座標を取得
+				CENTER_Y = image.rows / 2;	//画面中央（Y
+				circle(image, Point(CENTER_X, CENTER_Y), TARGET_R, Scalar(0, 255, 0), 2, LINE_AA);//目標円を描写
+
+				s_x = trackBox.center.x;//追跡物の重心座標
+				s_y = trackBox.center.y;
+				circle(image, Point(s_x, s_y), 1, Scalar(0, 0, 255), 2, LINE_AA);//重心描写
+
+				DISTANCE = sqrt(pow(s_x - CENTER_X, 2) + pow((s_y - CENTER_Y), 2));	//重心の中心点までの距離を計算
+				AREA = sqrt((trackBox.size.height * trackBox.size.width) / 4.0);//直径算出
+				SetDlgItemText(hwnd, IDC_OKTEST, "X");
+				if ((fabsf(DISTANCE) <= TEST_D) && (fabsf(TARGET_R - AREA) <= TEST_S)) {
+					SetDlgItemText(hwnd, IDC_OKTEST, "OK");
+					circle(image, Point(CENTER_X - 200, CENTER_Y - 200), 10, Scalar(100, 255, 100), 2, LINE_AA);//目標円を描写
+
+					if (OK_cc < 10) {
+						OK_counter++;
+					}
+					else {
+						OK_counter = 0;
+						s_timer = OFF;
+						SetDlgItemText(hwnd, IDC_START, "START");
+						Beep(890, 1000);
+					}
+				}
+				else {
+					OK_counter = 0;
+				}
+
+				SetDlgItemInt(hwnd, IDC_X, ccount * 40, 1);
+				SetDlgItemInt(hwnd, IDC_STAGE1, OK_cc, 1);
+				if (s_timer == ON)ccount++;
+				if (OK_counter == 10 && s_timer == ON) {
+					Beep(659, 200);
+					InvalidateRect(hwnd2, NULL, TRUE);//無効領域をhwnd2に発生 ターゲットの再読み込みを行う
+					OK_cc++;
+
+					rand_ax_p = rand_ax;
+					rand_ay_p = rand_ay;
+					rand_b_p = rand_b;
+					while (1) {
+						rand_ax = rand() % 500;//1-800間での乱数（座標)
+						rand_ay = rand() % 500;
+						if (((abs(rand_ax_p - rand_ax) < 300) && (abs(rand_ax_p - rand_ax) > 100)) && ((abs(rand_ay_p - rand_ay) < 300) && (abs(rand_ay_p - rand_ay) > 100)))
+							break;
+					}
+					while (1) {
+						rand_b = rand() % TAG_MAX + TAG_MIN;//までの乱数（大きさ）
+						if (abs(rand_b - rand_b_p) > 30)
+							break;
+					}
+					SetDlgItemInt(hwnd, IDC_EDIT_KI_X, rand_ax, 1);
+					SetDlgItemInt(hwnd, IDC_EDIT_KI_Y, rand_ay, 1);
+					SetDlgItemInt(hwnd, IDC_EDIT_KP_X, rand_b, 1);
+				}
+				else if (OK_counter > 15) {
+					OK_counter = 0;
+				}
+
+				/*--------------------------------------------------------------------*/
+
+
+			}
+		}
+		else if (trackObject < 0)
+			paused = false;
+		if (selectObject && selection.width > 0 && selection.height > 0)
+		{
+			Mat roi(image, selection);
+			bitwise_not(roi, roi);
+		}
+		imshow("CamShift Demo", image);
+		imshow("Histogram", histimg);
+		char c = (char)waitKey(10);
+		if (c == 27)
+			break;
+		switch (c)
+		{
+		case 'b':
+			backprojMode = !backprojMode;
+			break;
+		case 'c':
+			trackObject = 0;
+			histimg = Scalar::all(0);
+			break;
+		case 'h':
+			showHist = !showHist;
+			if (!showHist)
+				destroyWindow("Histogram");
+			else
+				namedWindow("Histogram", 1);
+			break;
+		case 'p':
+			paused = !paused;
+			break;
+		default:
+			;
+		}
+	}
+	return 0;
+}
+
+BOOL CALLBACK DialogFunc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	DWORD dwThread;
+
+
+	switch (message)
+	{
+
+		//ボタンが押されたときの処理
+	case WM_COMMAND:
+		switch (LOWORD(wParam))
+		{
+		case IDC_START:
+			if (s_timer == OFF)
+			{
+				SetDlgItemText(hwnd, IDC_START, "STOP");
+				s_timer = ON;
+				//ランダム場所でスタート
+				InvalidateRect(hwnd2, NULL, TRUE);//無効領域をhwnd2に発生 ターゲットの再読み込みを行う
+				rand_ax_p = 350;
+				rand_ay_p = 350;
+				rand_b_p = 200;
+
+				while (1) {
+					rand_ax = rand() % 500;//1-800間での乱数（座標)
+					rand_ay = rand() % 500;
+					if (((abs(rand_ax_p - rand_ax) < 300) && (abs(rand_ax_p - rand_ax) > 100)) && ((abs(rand_ay_p - rand_ay) < 300) && (abs(rand_ay_p - rand_ay) > 100)))
+						break;
+				}
+				while (1) {
+					rand_b = rand() % TAG_MAX + TAG_MIN;//までの乱数（大きさ）
+					if (abs(rand_b - rand_b_p) > 30)
+						break;
+				}
+				SetDlgItemInt(hwnd, IDC_EDIT_KI_X, rand_ax, 1);
+				SetDlgItemInt(hwnd, IDC_EDIT_KI_Y, rand_ay, 1);
+				SetDlgItemInt(hwnd, IDC_EDIT_KP_X, rand_b, 1);
+			}
+			else
+			{
+				SetDlgItemText(hwnd, IDC_START, "START");
+				s_timer = OFF;
+			}
+
+			break;
+		case IDC_STAGE2:
+			OK_cc = 0;
+			ccount = 0;
+			break;
+
+		case IDC_EDIT_DENTISY:
+
+			InvalidateRect(hwnd2, NULL, TRUE);//無効領域をhwnd2に発生 ターゲットの再読み込みを行う
+			rand_ax = 350;
+			rand_ay = 350;
+			rand_b = 100;
+			SetDlgItemInt(hwnd, IDC_EDIT_KI_X, rand_ax, 1);
+			SetDlgItemInt(hwnd, IDC_EDIT_KI_Y, rand_ay, 1);
+			SetDlgItemInt(hwnd, IDC_EDIT_KP_X, rand_b, 1);
+			break;
+
+		case IDC_FILE_WRITE:		//記録用
+			if (file_flag == OFF)
+			{
+				//PCの時間読み込み。
+				GetLocalTime(&systime);
+				//sprintf(FileName, "recognition rate%d%d_%dh%dm%d.csv", systime.wMonth, systime.wDay, systime.wHour, systime.wMinute, systime.wSecond);
+
+				//fp = fopen(FileName, "w+");
+				SetDlgItemText(hwnd, IDC_FILE_WRITE, "記録停止");
+				file_flag = ON;
+				init = ON;
+			}
+			else
+			{
+				SetDlgItemText(hwnd, IDC_FILE_WRITE, "記録開始");
+				file_flag = OFF;
+				fclose(fp);
+				fp = NULL;
+			}
+			break;
+
+			return 1;
+
+		}
+		return 0;
+
+		//タイマー内での処理
+	case WM_TIMER:
+		switch (LOWORD(wParam))
+		{
+		case 1:
+			//ccount++;
+			break;
+		}
+
+
+		//初期化処理
+	case WM_INITDIALOG:
+
+		//カメラキャプチャー開始
+		if (threadHandle != NULL) break;
+		//スレッド起動
+		threadHandle = (HANDLE)_beginthreadex(NULL, 0, CameraCaptureThread, NULL, 0, (unsigned int*)&dwThread);
+		if (!threadHandle) {
+			MessageBox(hwnd, "スレッド起動エラー", "debug", MB_OK);
+		}
+
+		return 1;
+
+
+		// ×ボタンをクリックしたときの処理
+	case WM_CLOSE:
+		//ダイアログを破棄
+		DestroyWindow(hwnd);
+		KillTimer(hwnd, 1);
+		KillTimer(hwnd, 2);
+		//カメラ終了
+		endFlag = TRUE;
+		WaitForSingleObject(threadHandle, INFINITE);
+		CloseHandle(threadHandle);
+		//OpenCVのWindowsをクローズ
+		cv::destroyAllWindows();
+		return 1;
+
+		//終了(ウィンドウを閉じた後の)処理
+	case WM_DESTROY:
+		PostQuitMessage(0);
+		return 1;
+	}
+	return 0;
+}
+
+LRESULT CALLBACK WinProc(HWND hwnd2, UINT msg, WPARAM wp, LPARAM lp)
+{
+	HDC hdc;
+	PAINTSTRUCT ps;
+	static HBRUSH brush;
+
+	switch (msg) {
+	case WM_DESTROY:
+		PostQuitMessage(0);
+		return 0;
+
+	case WM_PAINT:
+
+		hdc = BeginPaint(hwnd2, &ps);
+		brush = CreateSolidBrush(RGB(0, 255, 255));//円の色をブラシで塗る
+		SelectObject(hdc, brush);//ブラシを設定
+
+		if (s_timer == OFF) {
+			Ellipse(hdc, 350, 350, 450, 450);//円の座標指定（L_x,Ly,R_x,Ry）
+		}
+		else {
+			Ellipse(hdc, rand_ax, rand_ay, (rand_ax + rand_b), (rand_ay + rand_b));//円の座標指定（L_x,Ly,R_x,Ry）
+		}
+
+		EndPaint(hwnd2, &ps);
+
+		return 0;
+
+	}
+	return DefWindowProc(hwnd2, msg, wp, lp);
+}
+
+
+/*------------------------------------
+メイン関数
+-------------------------------------*/
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpszCmdLine, int nCmdShow)
+{
+	WNDCLASS wc;
+
+	srand((unsigned)time(NULL));
+
+	wc.style = CS_HREDRAW | CS_VREDRAW;
+	wc.lpfnWndProc = WinProc;
+	wc.cbClsExtra = wc.cbWndExtra = 0;
+	wc.hInstance = hInstance;
+	wc.hCursor = wc.hIcon = NULL;
+	wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+	wc.lpszClassName = "test";
+	wc.lpszMenuName = NULL;
+
+	if (!RegisterClass(&wc)) {
+		MSG("クラスの登録失敗");
+		return -1;
+	}
+
+	// (1)リソースに基づきダイアログボックスを作成する。自分で作ったダイアログのIDを合わせるように。
+	hwnd = CreateDialog(hInstance, MAKEINTRESOURCE(IDHELP), NULL, (DLGPROC)DialogFunc);
+	/*
+	DialogBox(
+		hInstance,
+		MAKEINTRESOURCE(IDHELP),
+		NULL,
+		(DLGPROC)DialogFunc);
+	*/
+	// ダイアログボックスが表示されない場合はプログラムを終了する。
+	if (hwnd == NULL)
+	{
+		MessageBox(NULL, "ダイアログボックスのIDが間違っていませんか?", "終了", MB_OK);
+		return 0;
+	}
+	hwnd2 = CreateWindowA("test", "テストウィンドウ", WS_VISIBLE | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+		0, 0, 800, 800, NULL, NULL, hInstance, NULL);
+	if (hwnd2 == NULL) {
+		MSG("ウィンドウ作成失敗");
+		return -1;
+	}
+	//インスタンスハンドル
+	hinst = hInstance;
+
+	// (2)ダイアログボックスを表示する。
+	ShowWindow(hwnd, SW_SHOW);
+	UpdateWindow(hwnd);
+	UpdateWindow(hwnd2);
+
+	// (3)メッセージループの実行を開始する(ダイアログ関数の処理を行う)。
+	while (GetMessage(&msg, NULL, 0, 0))
+	{
+		TranslateMessage(&msg); // キーボードメッセージを変換する
+		DispatchMessage(&msg);  // 1つのウィンドウプロシージャにメッセージを送る
+	}
+
+	//クラス解放
+	UnregisterClass("test", hinst);
+
+	return msg.wParam;
+}
